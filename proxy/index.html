@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Hermes Mobile</title>
+<style>
+  :root {
+    --bg: #0e1116; --card: #161b22; --border: #2a3138; --fg: #e6edf3;
+    --muted: #8b949e; --accent: #58a6ff; --danger: #f85149; --ok: #3fb950;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg);
+    font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; height: 100%; }
+  body { display: flex; flex-direction: column; height: 100dvh; }
+
+  #settings { padding: 12px; border-bottom: 1px solid var(--border); background: var(--card); }
+  #settings details summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+  #settings .row { display: flex; gap: 8px; margin-top: 8px; }
+  #settings input { flex: 1; background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 6px; padding: 8px; font-size: 14px; }
+  #settings input[type=password] { flex: 1; }
+
+  #status { padding: 8px 12px; font-size: 13px; color: var(--muted); border-bottom: 1px solid var(--border); }
+  #status .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #6e7681; margin-right: 6px; }
+  #status.on .dot { background: var(--ok); }
+  #status.err .dot { background: var(--danger); }
+
+  #log { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+  .msg { max-width: 85%; padding: 8px 12px; border-radius: 12px; white-space: pre-wrap; word-wrap: break-word; }
+  .msg.me { align-self: flex-end; background: var(--accent); color: #04121f; }
+  .msg.bot { align-self: flex-start; background: var(--card); border: 1px solid var(--border); }
+  .msg.sys { align-self: center; color: var(--muted); font-size: 12px; background: transparent; border: none; }
+  .state { align-self: center; color: var(--muted); font-size: 12px; font-style: italic; }
+
+  .card { align-self: stretch; background: var(--card); border: 1px solid var(--accent);
+    border-radius: 10px; padding: 12px; }
+  .card .q { margin-bottom: 6px; }
+  .card .cmd { font-family: ui-monospace, monospace; font-size: 12px; color: var(--muted);
+    background: var(--bg); border-radius: 6px; padding: 6px; overflow-x: auto; margin: 6px 0; }
+  .card .opts { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+  .card button { background: var(--accent); color: #04121f; border: none; border-radius: 8px;
+    padding: 8px 14px; font-size: 14px; cursor: pointer; }
+  .card button.danger { background: var(--danger); color: #fff; }
+  .card button.cancel { background: transparent; color: var(--muted); border: 1px solid var(--border); }
+
+  #composer { display: flex; gap: 8px; padding: 10px 12px; border-top: 1px solid var(--border); background: var(--card); }
+  #composer input { flex: 1; background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 10px; font-size: 15px; }
+  #composer button { background: var(--accent); color: #04121f; border: none; border-radius: 8px;
+    padding: 0 16px; font-size: 15px; cursor: pointer; }
+  #composer button:disabled { opacity: .4; cursor: default; }
+</style>
+</head>
+<body>
+  <div id="settings">
+    <details>
+      <summary>Connection settings</summary>
+      <div class="row"><input id="url" placeholder="auto (same origin)" value=""></div>
+      <div class="row"><input id="token" type="password" placeholder="MOBILE_TOKEN" value=""></div>
+      <div class="row">
+        <input id="devid" placeholder="device id" value="phone-1">
+        <input id="devname" placeholder="device name" value="My Phone">
+      </div>
+      <div class="row"><button id="connect" style="flex:1; background:var(--accent); color:#04121f; border:none; border-radius:8px; padding:9px;">Connect</button></div>
+    </details>
+  </div>
+  <div id="status"><span class="dot"></span><span id="statustext">disconnected</span></div>
+  <div id="log"></div>
+  <div id="composer">
+    <input id="input" placeholder="Message Hermes…" disabled>
+    <button id="send" disabled>Send</button>
+  </div>
+
+<script>
+(function () {
+  var ws = null, statusEl = document.getElementById('status'),
+      statustext = document.getElementById('statustext'),
+      log = document.getElementById('log'), input = document.getElementById('input'),
+      sendBtn = document.getElementById('send'), connectBtn = document.getElementById('connect');
+
+  function $el(id){ return document.getElementById(id); }
+  function save(){ ['url','token','devid','devname'].forEach(function(k){
+    localStorage.setItem('hm-'+k, $el(k).value); }); }
+  function load(){ ['url','token','devid','devname'].forEach(function(k){
+    var v = localStorage.getItem('hm-'+k); if (v !== null) $el(k).value = v; }); }
+  load();
+
+  function addMsg(kind, text){ var d = document.createElement('div');
+    d.className = 'msg ' + kind; d.textContent = text; log.appendChild(d); log.scrollTop = log.scrollHeight; }
+  function addState(text){ var d = document.createElement('div');
+    d.className = 'state'; d.textContent = text; log.appendChild(d); log.scrollTop = log.scrollHeight; }
+
+  function addCard(p){
+    var c = document.createElement('div'); c.className = 'card';
+    var q = document.createElement('div'); q.className = 'q'; q.textContent = p.text || '(approval)'; c.appendChild(q);
+    if (p.command){ var cmd = document.createElement('div'); cmd.className = 'cmd'; cmd.textContent = p.command; c.appendChild(cmd); }
+    var opts = document.createElement('div'); opts.className = 'opts';
+    (p.options || []).forEach(function(o){
+      var b = document.createElement('button');
+      b.textContent = o.label || o.id;
+      if (o.style === 'danger') b.className = 'danger';
+      if (o.id === 'deny' || o.id === 'cancel') b.className = 'danger';
+      b.onclick = function(){
+        ws.send(JSON.stringify({t:'prompt', prompt_id: p.id, option_id: o.id}));
+        c.remove();
+      };
+      opts.appendChild(b);
+    });
+    c.appendChild(opts); log.appendChild(c); log.scrollTop = log.scrollHeight;
+  }
+
+  function connect(){
+    if (ws){ ws.close(); ws = null; }
+    var url = $el('url').value.trim();
+    if (!url) url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws';
+    var token = $el('token').value.trim();
+    if (!url || !token){ alert('Fill in server URL and token'); return; }
+    save();
+    try { ws = new WebSocket(url); } catch(e){ setStatus('error connecting'); return; }
+
+    ws.onopen = function(){
+      setStatus('on', 'connecting…');
+      ws.send(JSON.stringify({ t:'hello', token: token,
+        device: { id: $el('devid').value.trim() || 'phone-1', name: $el('devname').value.trim() || 'My Phone' } }));
+    };
+    ws.onclose = function(){ setStatus('', 'disconnected'); input.disabled = true; sendBtn.disabled = true; };
+    ws.onerror = function(){ setStatus('err', 'connection error'); };
+    ws.onmessage = function(ev){
+      var m; try { m = JSON.parse(ev.data); } catch(e){ return; }
+      switch (m.t){
+        case 'ready': setStatus('on', 'connected as ' + (m.device && m.device.id || 'device'));
+                      input.disabled = false; sendBtn.disabled = false; break;
+        case 'typing': break;
+        case 'avatar': addState('● ' + m.state); break;
+        case 'message':
+          // accumulate chunks by id
+          var chunks = {};
+          var key = m.id;
+          if (m.chunk && m.chunk.total > 1){ chunks[key] = (chunks[key] || '') + m.text;
+            if (m.chunk.index === m.chunk.total - 1){ addMsg('bot', chunks[key]); delete chunks[key]; } }
+          else addMsg('bot', m.text);
+          break;
+        case 'prompt': addCard(m); break;
+        case 'prompt_done': break;
+        case 'error': addMsg('sys', 'error: ' + (m.error || m.text || '')); break;
+        default: if (m.t !== 'typing' && m.t !== 'avatar' && m.t !== 'ready') addMsg('sys', JSON.stringify(m).slice(0,200));
+      }
+    };
+  }
+
+  function setStatus(cls, text){ statusEl.className = cls ? (cls==='on'?'on':cls==='err'?'err':'') : ''; statustext.textContent = text; }
+  function send(){
+    if (!ws || ws.readyState !== 1) return;
+    var t = input.value.trim(); if (!t) return;
+    ws.send(JSON.stringify({ t:'text', id: 'm'+Date.now(), text: t }));
+    addMsg('me', t); input.value = '';
+  }
+
+  connectBtn.onclick = connect;
+  sendBtn.onclick = send;
+  input.onkeydown = function(e){ if (e.key === 'Enter') send(); };
+  window.addEventListener('beforeunload', save);
+})();
+</script>
+</body>
+</html>
