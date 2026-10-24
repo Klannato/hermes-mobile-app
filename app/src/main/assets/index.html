@@ -31,7 +31,6 @@
   .msg.me { align-self: flex-end; background: var(--accent); color: #04121f; }
   .msg.bot { align-self: flex-start; background: var(--card); border: 1px solid var(--border); }
   .msg.sys { align-self: center; color: var(--muted); font-size: 12px; background: transparent; border: none; }
-  .state { align-self: center; color: var(--muted); font-size: 12px; font-style: italic; }
 
   .card { align-self: stretch; background: var(--card); border: 1px solid var(--accent);
     border-radius: 10px; padding: 12px; }
@@ -79,11 +78,24 @@
       log = document.getElementById('log'), input = document.getElementById('input'),
       sendBtn = document.getElementById('send'), connectBtn = document.getElementById('connect');
 
-  var busy = false;
+  // --- keep-awake: engage only for long turns (short chats shouldn't flash
+  //     the "working" notification or hold a wake-lock) ---
+  var BUSY_DELAY_MS = 15000;
+  var busy = false, turnActive = false, busyTimer = null;
   function setBusy(b){
     if (b === busy) return;
     busy = b;
     try { if (window.HermesNative) HermesNative.setBusy(b); } catch(e){}
+  }
+  function turnStarted(){
+    turnActive = true;
+    clearTimeout(busyTimer);
+    busyTimer = setTimeout(function(){ if (turnActive) setBusy(true); }, BUSY_DELAY_MS);
+  }
+  function turnDone(){
+    turnActive = false;
+    clearTimeout(busyTimer);
+    setBusy(false);
   }
 
   function scheduleReconnect(){
@@ -98,19 +110,26 @@
   function load(){ ['url','token','devid','devname'].forEach(function(k){
     var v = localStorage.getItem('hm-'+k); if (v !== null) $el(k).value = v; }); }
   load();
-  // Returning run (token already saved): reconnect automatically so the app is
-  // ready without tapping Connect. First run (no token): expand settings so the
-  // token field is visible.
+  // Returning run (token already saved): reconnect automatically. First run
+  // (no token): expand settings so the token field is visible.
   (function(){
     var d = document.querySelector('#settings details');
     if (!$el('token').value.trim()) { if (d) d.setAttribute('open',''); }
     else if ($el('url').value.trim()) { if (d) d.removeAttribute('open'); setTimeout(connect, 500); }
   })();
 
+  // --- rendering: one DOM element per message id, so multi-chunk replies
+  //     accumulate and streaming edits update in place ---
+  var chunks = {};   // message id -> accumulated text across chunk frames
+  var msgEls = {};   // message id -> DOM element
+  function botEl(id){
+    var el = msgEls[id];
+    if (!el){ el = document.createElement('div'); el.className = 'msg bot'; log.appendChild(el); msgEls[id] = el; }
+    return el;
+  }
+  function scroll(){ log.scrollTop = log.scrollHeight; }
   function addMsg(kind, text){ var d = document.createElement('div');
-    d.className = 'msg ' + kind; d.textContent = text; log.appendChild(d); log.scrollTop = log.scrollHeight; }
-  function addState(text){ var d = document.createElement('div');
-    d.className = 'state'; d.textContent = text; log.appendChild(d); log.scrollTop = log.scrollHeight; }
+    d.className = 'msg ' + kind; d.textContent = text; log.appendChild(d); scroll(); }
 
   function addCard(p){
     var c = document.createElement('div'); c.className = 'card';
@@ -128,7 +147,7 @@
       };
       opts.appendChild(b);
     });
-    c.appendChild(opts); log.appendChild(c); log.scrollTop = log.scrollHeight;
+    c.appendChild(opts); log.appendChild(c); scroll();
   }
 
   function connect(){
@@ -138,34 +157,42 @@
     var token = $el('token').value.trim();
     if (!url || !token){ alert('Fill in server URL and token'); return; }
     save();
-    try { ws = new WebSocket(url); } catch(e){ setStatus('error connecting'); return; }
+    try { ws = new WebSocket(url); } catch(e){ setStatus('err', 'error connecting'); return; }
 
     ws.onopen = function(){
       setStatus('on', 'connecting…');
       ws.send(JSON.stringify({ t:'hello', token: token,
         device: { id: $el('devid').value.trim() || 'phone-1', name: $el('devname').value.trim() || 'My Phone' } }));
     };
-    ws.onclose = function(){ setStatus('', 'disconnected'); input.disabled = true; sendBtn.disabled = true; setBusy(false); scheduleReconnect(); };
-    ws.onerror = function(){ setStatus('err', 'connection error'); setBusy(false); };
+    ws.onclose = function(){ setStatus('', 'disconnected'); input.disabled = true; sendBtn.disabled = true; turnDone(); scheduleReconnect(); };
+    ws.onerror = function(){ setStatus('err', 'connection error'); turnDone(); };
     ws.onmessage = function(ev){
       var m; try { m = JSON.parse(ev.data); } catch(e){ return; }
       switch (m.t){
         case 'ready': setStatus('on', 'connected as ' + (m.device && m.device.id || 'device'));
                       input.disabled = false; sendBtn.disabled = false; try { if (window.HermesNative) HermesNative.resetReconnect(); } catch(e){} break;
         case 'typing': break;
-        case 'avatar': addState('● ' + m.state); if (m.state === 'idle') setBusy(false); break;
-        case 'message':
-          // accumulate chunks by id
-          var chunks = {};
-          var key = m.id;
-          if (m.chunk && m.chunk.total > 1){ chunks[key] = (chunks[key] || '') + m.text;
-            if (m.chunk.index === m.chunk.total - 1){ addMsg('bot', chunks[key]); delete chunks[key]; } }
-          else addMsg('bot', m.text);
+        case 'avatar': if (m.state === 'idle') turnDone(); break;   // no chat-line spam; drives busy only
+        case 'message': {
+          var id = m.id || ('m'+Date.now());
+          var el = botEl(id);
+          if (m.edit) {
+            el.textContent = m.text;                  // streaming: replace in place
+          } else if (m.chunk && m.chunk.total > 1) {
+            chunks[id] = (chunks[id] || '') + m.text; // accumulate across chunks
+            el.textContent = chunks[id];
+            if (m.chunk.index === m.chunk.total - 1) delete chunks[id];
+          } else {
+            el.textContent = m.text;                  // single-chunk reply
+          }
+          scroll();
+          if (m.final) turnDone();
           break;
+        }
         case 'prompt': addCard(m); break;
         case 'prompt_done': break;
         case 'error': addMsg('sys', 'error: ' + (m.error || m.text || '')); break;
-        default: if (m.t !== 'typing' && m.t !== 'avatar' && m.t !== 'ready') addMsg('sys', JSON.stringify(m).slice(0,200));
+        default: break;   // ignore unknown frames silently
       }
     };
   }
@@ -176,7 +203,7 @@
     var t = input.value.trim(); if (!t) return;
     ws.send(JSON.stringify({ t:'text', id: 'm'+Date.now(), text: t }));
     addMsg('me', t); input.value = '';
-    setBusy(true);
+    turnStarted();
   }
 
   connectBtn.onclick = connect;
